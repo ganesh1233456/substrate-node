@@ -1,17 +1,42 @@
+// This file is part of Substrate.
+
+// Copyright (C) Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+use super::benchmarking::{inherent_benchmark_data, RemarkBuilder, TransferKeepAliveBuilder};
 use crate::{
-	benchmarking::{inherent_benchmark_data, RemarkBuilder, TransferKeepAliveBuilder},
-	chain_spec,
-	cli::{Cli, Subcommand},
-	service,
+	chain_spec, service,
+	service::{new_partial, FullClient},
+	Cli, Subcommand,
 };
-use frame_benchmarking_cli::{BenchmarkCmd, ExtrinsicFactory, SUBSTRATE_REFERENCE_HARDWARE};
-use node_template_runtime::{Block, EXISTENTIAL_DEPOSIT};
-use sc_cli::{ChainSpec, RuntimeVersion, SubstrateCli};
+use frame_benchmarking_cli::*;
+use kitchensink_runtime::{ExistentialDeposit, RuntimeApi};
+use node_executor::ExecutorDispatch;
+use node_primitives::Block;
+use sc_cli::{ChainSpec, Result, RuntimeVersion, SubstrateCli};
 use sc_service::PartialComponents;
 use sp_keyring::Sr25519Keyring;
 
+use std::sync::Arc;
+
 #[cfg(feature = "try-runtime")]
-use try_runtime_cli::block_building_info::timestamp_with_aura_info;
+use {
+	kitchensink_runtime::constants::time::SLOT_DURATION,
+	try_runtime_cli::block_building_info::substrate_info,
+};
 
 impl SubstrateCli for Cli {
 	fn impl_name() -> String {
@@ -31,82 +56,50 @@ impl SubstrateCli for Cli {
 	}
 
 	fn support_url() -> String {
-		"support.anonymous.an".into()
+		"https://github.com/paritytech/substrate/issues/new".into()
 	}
 
 	fn copyright_start_year() -> i32 {
 		2017
 	}
 
-	fn load_spec(&self, id: &str) -> Result<Box<dyn sc_service::ChainSpec>, String> {
-		Ok(match id {
-			"dev" => Box::new(chain_spec::development_config()?),
-			"" | "local" => Box::new(chain_spec::local_testnet_config()?),
+	fn load_spec(&self, id: &str) -> std::result::Result<Box<dyn sc_service::ChainSpec>, String> {
+		let spec = match id {
+			"" =>
+				return Err(
+					"Please specify which chain you want to run, e.g. --dev or --chain=local"
+						.into(),
+				),
+			"dev" => Box::new(chain_spec::development_config()),
+			"local" => Box::new(chain_spec::local_testnet_config()),
+			"fir" | "flaming-fir" => Box::new(chain_spec::flaming_fir_config()?),
+			"staging" => Box::new(chain_spec::staging_testnet_config()),
 			path =>
 				Box::new(chain_spec::ChainSpec::from_json_file(std::path::PathBuf::from(path))?),
-		})
+		};
+		Ok(spec)
 	}
 
 	fn native_runtime_version(_: &Box<dyn ChainSpec>) -> &'static RuntimeVersion {
-		&node_template_runtime::VERSION
+		&kitchensink_runtime::VERSION
 	}
 }
 
-/// Parse and run command line arguments
-pub fn run() -> sc_cli::Result<()> {
+/// Parse command line arguments into service configuration.
+pub fn run() -> Result<()> {
 	let cli = Cli::from_args();
 
 	match &cli.subcommand {
-		Some(Subcommand::Key(cmd)) => cmd.run(&cli),
-		Some(Subcommand::BuildSpec(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.sync_run(|config| cmd.run(config.chain_spec, config.network))
-		},
-		Some(Subcommand::CheckBlock(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, import_queue, .. } =
-					service::new_partial(&config)?;
-				Ok((cmd.run(client, import_queue), task_manager))
+		None => {
+			let runner = cli.create_runner(&cli.run)?;
+			runner.run_node_until_exit(|config| async move {
+				service::new_full(config, cli).map_err(sc_cli::Error::Service)
 			})
 		},
-		Some(Subcommand::ExportBlocks(cmd)) => {
+		Some(Subcommand::Inspect(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
-			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, .. } = service::new_partial(&config)?;
-				Ok((cmd.run(client, config.database), task_manager))
-			})
-		},
-		Some(Subcommand::ExportState(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, .. } = service::new_partial(&config)?;
-				Ok((cmd.run(client, config.chain_spec), task_manager))
-			})
-		},
-		Some(Subcommand::ImportBlocks(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, import_queue, .. } =
-					service::new_partial(&config)?;
-				Ok((cmd.run(client, import_queue), task_manager))
-			})
-		},
-		Some(Subcommand::PurgeChain(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.sync_run(|config| cmd.run(config.database))
-		},
-		Some(Subcommand::Revert(cmd)) => {
-			let runner = cli.create_runner(cmd)?;
-			runner.async_run(|config| {
-				let PartialComponents { client, task_manager, backend, .. } =
-					service::new_partial(&config)?;
-				let aux_revert = Box::new(|client, _, blocks| {
-					sc_consensus_grandpa::revert(client, blocks)?;
-					Ok(())
-				});
-				Ok((cmd.run(client, backend, Some(aux_revert)), task_manager))
-			})
+
+			runner.sync_run(|config| cmd.run::<Block, RuntimeApi, ExecutorDispatch>(config))
 		},
 		Some(Subcommand::Benchmark(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
@@ -124,11 +117,12 @@ pub fn run() -> sc_cli::Result<()> {
 							)
 						}
 
-						cmd.run::<Block, service::ExecutorDispatch>(config)
+						cmd.run::<Block, ExecutorDispatch>(config)
 					},
 					BenchmarkCmd::Block(cmd) => {
-						let PartialComponents { client, .. } = service::new_partial(&config)?;
-						cmd.run(client)
+						// ensure that we keep the task manager alive
+						let partial = new_partial(&config)?;
+						cmd.run(partial.client)
 					},
 					#[cfg(not(feature = "runtime-benchmarks"))]
 					BenchmarkCmd::Storage(_) => Err(
@@ -137,47 +131,107 @@ pub fn run() -> sc_cli::Result<()> {
 					),
 					#[cfg(feature = "runtime-benchmarks")]
 					BenchmarkCmd::Storage(cmd) => {
-						let PartialComponents { client, backend, .. } =
-							service::new_partial(&config)?;
-						let db = backend.expose_db();
-						let storage = backend.expose_storage();
+						// ensure that we keep the task manager alive
+						let partial = new_partial(&config)?;
+						let db = partial.backend.expose_db();
+						let storage = partial.backend.expose_storage();
 
-						cmd.run(config, client, db, storage)
+						cmd.run(config, partial.client, db, storage)
 					},
 					BenchmarkCmd::Overhead(cmd) => {
-						let PartialComponents { client, .. } = service::new_partial(&config)?;
-						let ext_builder = RemarkBuilder::new(client.clone());
+						// ensure that we keep the task manager alive
+						let partial = new_partial(&config)?;
+						let ext_builder = RemarkBuilder::new(partial.client.clone());
 
 						cmd.run(
 							config,
-							client,
+							partial.client,
 							inherent_benchmark_data()?,
 							Vec::new(),
 							&ext_builder,
 						)
 					},
 					BenchmarkCmd::Extrinsic(cmd) => {
-						let PartialComponents { client, .. } = service::new_partial(&config)?;
+						// ensure that we keep the task manager alive
+						let partial = service::new_partial(&config)?;
 						// Register the *Remark* and *TKA* builders.
 						let ext_factory = ExtrinsicFactory(vec![
-							Box::new(RemarkBuilder::new(client.clone())),
+							Box::new(RemarkBuilder::new(partial.client.clone())),
 							Box::new(TransferKeepAliveBuilder::new(
-								client.clone(),
+								partial.client.clone(),
 								Sr25519Keyring::Alice.to_account_id(),
-								EXISTENTIAL_DEPOSIT,
+								ExistentialDeposit::get(),
 							)),
 						]);
 
-						cmd.run(client, inherent_benchmark_data()?, Vec::new(), &ext_factory)
+						cmd.run(
+							partial.client,
+							inherent_benchmark_data()?,
+							Vec::new(),
+							&ext_factory,
+						)
 					},
 					BenchmarkCmd::Machine(cmd) =>
 						cmd.run(&config, SUBSTRATE_REFERENCE_HARDWARE.clone()),
 				}
 			})
 		},
+		Some(Subcommand::Key(cmd)) => cmd.run(&cli),
+		Some(Subcommand::Sign(cmd)) => cmd.run(),
+		Some(Subcommand::Verify(cmd)) => cmd.run(),
+		Some(Subcommand::Vanity(cmd)) => cmd.run(),
+		Some(Subcommand::BuildSpec(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.sync_run(|config| cmd.run(config.chain_spec, config.network))
+		},
+		Some(Subcommand::CheckBlock(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.async_run(|config| {
+				let PartialComponents { client, task_manager, import_queue, .. } =
+					new_partial(&config)?;
+				Ok((cmd.run(client, import_queue), task_manager))
+			})
+		},
+		Some(Subcommand::ExportBlocks(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.async_run(|config| {
+				let PartialComponents { client, task_manager, .. } = new_partial(&config)?;
+				Ok((cmd.run(client, config.database), task_manager))
+			})
+		},
+		Some(Subcommand::ExportState(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.async_run(|config| {
+				let PartialComponents { client, task_manager, .. } = new_partial(&config)?;
+				Ok((cmd.run(client, config.chain_spec), task_manager))
+			})
+		},
+		Some(Subcommand::ImportBlocks(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.async_run(|config| {
+				let PartialComponents { client, task_manager, import_queue, .. } =
+					new_partial(&config)?;
+				Ok((cmd.run(client, import_queue), task_manager))
+			})
+		},
+		Some(Subcommand::PurgeChain(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.sync_run(|config| cmd.run(config.database))
+		},
+		Some(Subcommand::Revert(cmd)) => {
+			let runner = cli.create_runner(cmd)?;
+			runner.async_run(|config| {
+				let PartialComponents { client, task_manager, backend, .. } = new_partial(&config)?;
+				let aux_revert = Box::new(|client: Arc<FullClient>, backend, blocks| {
+					sc_consensus_babe::revert(client.clone(), backend, blocks)?;
+					grandpa::revert(client, blocks)?;
+					Ok(())
+				});
+				Ok((cmd.run(client, backend, Some(aux_revert)), task_manager))
+			})
+		},
 		#[cfg(feature = "try-runtime")]
 		Some(Subcommand::TryRuntime(cmd)) => {
-			use crate::service::ExecutorDispatch;
 			use sc_executor::{sp_wasm_interface::ExtendedHostFunctions, NativeExecutionDispatch};
 			let runner = cli.create_runner(cmd)?;
 			runner.async_run(|config| {
@@ -187,7 +241,8 @@ pub fn run() -> sc_cli::Result<()> {
 				let task_manager =
 					sc_service::TaskManager::new(config.tokio_handle.clone(), registry)
 						.map_err(|e| sc_cli::Error::Service(sc_service::Error::Prometheus(e)))?;
-				let info_provider = timestamp_with_aura_info(6000);
+
+				let info_provider = substrate_info(SLOT_DURATION);
 
 				Ok((
 					cmd.run::<Block, ExtendedHostFunctions<
@@ -205,12 +260,6 @@ pub fn run() -> sc_cli::Result<()> {
 		Some(Subcommand::ChainInfo(cmd)) => {
 			let runner = cli.create_runner(cmd)?;
 			runner.sync_run(|config| cmd.run::<Block>(&config))
-		},
-		None => {
-			let runner = cli.create_runner(&cli.run)?;
-			runner.run_node_until_exit(|config| async move {
-				service::new_full(config).map_err(sc_cli::Error::Service)
-			})
 		},
 	}
 }
